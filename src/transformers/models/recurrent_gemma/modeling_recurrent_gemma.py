@@ -865,7 +865,8 @@ class RecurrentGemmaForCausalLM(RecurrentGemmaPreTrainedModel, GenerationMixin):
         )
 
         hidden_states = outputs[0]
-        logits = self.lm_head(hidden_states)
+        # logits = self.lm_head(hidden_states)
+        logits = self.lm_head(hidden_states[:,-1,:].unsqueeze(dim=1)) # Fix for OPRM
 
         # Soft-cap the logits TODO remove if always done.
         # if self.config.logits_soft_cap is not None:

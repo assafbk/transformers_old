@@ -1197,6 +1197,9 @@ class GenerationMixin:
             if "assistant_encoder_outputs" in model_kwargs:
                 model_args |= {"assistant_encoder_outputs"}
 
+        # OPRM inference
+        model_args |= {"oprm_config"}
+
         for key, value in model_kwargs.items():
             if value is not None and key not in model_args:
                 unused_model_args.append(key)
@@ -1804,6 +1807,9 @@ class GenerationMixin:
         self._validate_model_kwargs(model_kwargs.copy())
         self._validate_assistant(assistant_model)
 
+        # OPRM inference
+        oprm_config = model_kwargs['oprm_config']
+
         # 2. Set generation parameters if not already defined
         if synced_gpus is None:
             if is_deepspeed_zero3_enabled() and dist.get_world_size() > 1:
@@ -2043,6 +2049,16 @@ class GenerationMixin:
                 **model_kwargs,
             )
 
+            # OPRM inference
+            if oprm_config['parallelize_chunks']:
+                generation_config.return_dict_in_generate = True
+                generation_config.output_logits = True
+                orig_seq_len = input_ids.shape[1]
+                input_ids = chunk_and_parallelize(input_ids, oprm_config)
+                prepared_stopping_criteria[0].max_length = prepared_stopping_criteria[0].max_length - orig_seq_len + input_ids.shape[1]
+                generation_config.max_length = prepared_stopping_criteria[0].max_length
+                model_kwargs['attention_mask'] = torch.ones_like(input_ids).to(torch.int64).to(input_ids.device)
+
             # 12. run sample (it degenerates to greedy search when `generation_config.do_sample=False`)
             result = self._sample(
                 input_ids,
@@ -2213,6 +2229,24 @@ class GenerationMixin:
                 should_convert_cache = True
             if should_convert_cache:
                 result.past_key_values = result.past_key_values.to_legacy_cache()
+        
+        # OPRM inference
+        if oprm_config['inference_mode'] == 'oprm' and oprm_config['chunk_selection_method'] == 'entropy_first_tok':
+            if oprm_config['idk_filter_active']:
+                idk_filtered_chunk_indices = torch.arange(result.logits[0].shape[0], device=device)[torch.isin(torch.max(result.logits[0], dim=1)[1].cpu(), torch.tensor(oprm_config['idk_token']), invert=True)]
+                if len(idk_filtered_chunk_indices) == 0:
+                    result = result.sequences[[0]]
+                    oprm_config['min_ent'] = 1000 # just something very large that is not torch.inf
+                else:
+                    idk_filtered_chunks = result.logits[0][idk_filtered_chunk_indices]
+                    selected_chunk_idx, entropy_per_chunk = get_min_entropy_chunk_idx(idk_filtered_chunks)
+                    result = result.sequences[idk_filtered_chunk_indices[selected_chunk_idx]]
+                    oprm_config['min_ent'] = torch.min(entropy_per_chunk)
+            else:
+                selected_chunk_idx, entropy_per_chunk = get_min_entropy_chunk_idx(result.logits[0])
+                result = result.sequences[selected_chunk_idx]
+                oprm_config['min_ent'] = torch.min(entropy_per_chunk)
+        
         return result
 
     def _has_unfinished_sequences(
@@ -4539,3 +4573,70 @@ def _dola_select_contrast(
     final_logits, base_logits = _relative_top_filter(final_logits, base_logits)
     logits = final_logits - base_logits
     return logits
+
+
+
+# OPRM inference
+def chunk_and_parallelize(input_ids, oprm_config):
+    
+    partition_indices = find_partition_indices(input_ids[0].cpu(), oprm_config)
+    ctx_start_token = partition_indices[0]
+    ctx_end_token = partition_indices[-1]
+    input_ids_parallelize_chunks = []
+    pad_token_id = oprm_config['pad_token_id']
+    for ip in range(len(partition_indices)-1):
+        ctx_chunk_i_start, ctx_chunk_i_end = partition_indices[ip], partition_indices[ip+1] 
+        if ip == len(partition_indices)-2:
+            chunk_size_toks = oprm_config['chunk_size']
+            num_pad_toks = chunk_size_toks - (ctx_chunk_i_end - ctx_chunk_i_start)
+            cur_input_ids = torch.concat([input_ids[:, :ctx_start_token], input_ids[:,ctx_chunk_i_start:ctx_chunk_i_end], torch.tensor([[pad_token_id] * num_pad_toks], dtype=input_ids.dtype).to(input_ids.device), input_ids[:,ctx_end_token:]], dim=1)
+        else:
+            cur_input_ids = torch.concat([input_ids[:, :ctx_start_token], input_ids[:,ctx_chunk_i_start:ctx_chunk_i_end], input_ids[:,ctx_end_token:]], dim=1)
+        
+        input_ids_parallelize_chunks.append(cur_input_ids)
+
+    input_ids_parallelize_chunks = torch.vstack(input_ids_parallelize_chunks)
+    
+    return input_ids_parallelize_chunks
+
+def find_partition_indices(prompt, oprm_config):
+    if oprm_config['dataset'] == 'longbench':
+        return find_partition_indices_longbench(prompt, oprm_config)
+    else:
+        raise(f'bad dataset {oprm_config["dataset"]}')
+        
+'''
+ctx_len_toks - len in tokens including pre ctx tokens
+'''
+def find_partition_indices_longbench(prompt, oprm_config):
+    chunk_size_toks = oprm_config['chunk_size']
+    num_pre_ctx_tokens = oprm_config['num_pre_ctx_tokens']
+    partition_indices = torch.arange(num_pre_ctx_tokens, oprm_config['ctx_len_toks'], chunk_size_toks).tolist()
+    partition_indices.append(oprm_config['ctx_len_toks'])
+    return partition_indices
+
+def get_min_entropy_chunk_idx(logits_per_chunk):
+    entropy_per_chunk = []
+    for i_chunk in range(logits_per_chunk.shape[0]):
+        cur_entropy_per_chunk = calc_mean_entropy(logits_per_chunk[i_chunk][None, None, ...], no_mean=True)
+        entropy_per_chunk.append(cur_entropy_per_chunk)
+    
+    entropy_per_chunk = torch.vstack(entropy_per_chunk)
+    min_entropy_chunk_idx = torch.min(entropy_per_chunk, dim=0)[1]
+    return min_entropy_chunk_idx, entropy_per_chunk
+
+'''for each prediction, calculates the entropy (of the predicted distribution over all tokens), and then calculates the mean over all predictions in the batch'''
+def calc_mean_entropy(predicted_logits, no_mean=False):
+    vocab_size = predicted_logits.shape[2]
+    probabilities = torch.softmax(predicted_logits.reshape(-1, vocab_size), axis=1)
+    prob_zeros_mask = probabilities == 0.
+    tmp = probabilities * torch.log2(probabilities) # when a probability equals 0 this gives 0*-inf and torch returns nan. by the entropy definition it should equal 0, so we fix that
+    tmp[prob_zeros_mask] = 0.
+    if torch.any(torch.isnan(tmp)):
+        warnings.warn("Warning: entropy calculation (metric) has nans in it")
+
+    entropy = -torch.sum(tmp, axis=1)
+    if no_mean:
+        return entropy
+    else:
+        return torch.mean(entropy)
